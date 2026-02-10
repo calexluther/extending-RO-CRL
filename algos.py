@@ -1,42 +1,7 @@
 import numpy as np
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Set, Tuple
-
-
-def sym(A: np.ndarray) -> np.ndarray:
-    return 0.5 * (A + A.T)
-
-def principal_eigvec(R: np.ndarray) -> np.ndarray:
-    R = sym(R)
-    w, V = np.linalg.eigh(R)
-    idx = int(np.argmax(np.abs(w)))
-    return V[:, idx]
-
-def cov_from_sum(sum_x: np.ndarray, sum_xxT: np.ndarray, n: int) -> np.ndarray:
-    mu = sum_x / n
-    return (sum_xxT / n) - np.outer(mu, mu)
-
-def pinv_precision(Sigma: np.ndarray, ridge: float = 1e-8) -> np.ndarray:
-    """
-    compute precision matrix Theta as pseudo-inverse of Sigma:
-    Theta = (Sigma + ridge * I)^+
-    """
-    Sigma = sym(Sigma) + ridge * np.eye(Sigma.shape[0])
-    return np.linalg.pinv(Sigma)
-
-def transitive_closure(adj: np.ndarray) -> np.ndarray:
-    n = adj.shape[0]
-    reach = adj.astype(bool).copy()
-    for k in range(n):
-        reach |= reach[:, [k]] & reach[[k], :]
-    return reach.astype(int)
-
-def parents_from_adj(adj: np.ndarray) -> List[List[int]]:
-    """
-    get parents of each node from adjacency matrix
-    """
-    n = adj.shape[0]
-    return [list(np.where(adj[:, j] != 0)[0]) for j in range(n)]
+from utilities import *
 
 @dataclass
 class ActionCovStats:
@@ -91,6 +56,17 @@ class ROCRLLearner:
         self.Ghat: Optional[np.ndarray] = None    # n x n (adjacency matrix)
         self.pat: Optional[List[List[int]]] = None # parents of each node in Ghat
 
+        self.counts_A0 = {k: 0 for k in range(self.n + 1)}
+        self.epsmax = 0.25
+        self.delta = 0.05
+
+        def record_action_pull(self, a_t: Set[int]):
+            if len(a_t) == 0:
+                self.counts_A0[0] += 1
+            elif len(a_t) == 1:
+                i = next(iter(a_t))
+                self.counts_A0[i] += 1
+
         def observe(self, x_t: np.ndarray, u_t: float, a_t: Set[int]):
             """
             observe data at time t and update statistics
@@ -141,7 +117,7 @@ class ROCRLLearner:
             self.Zhat = Zhat
             return Zhat
         
-        def update_graph(self) -> np.ndarray:
+        def update_graph(self, use_transitive_closure: bool = True) -> np.ndarray:
             """
             compute Rz_hat_{i,t} = Hdag_t @ R_{i,t} @ H_t for each intervention i
             assign edge i -> j if ||[Rz_hat_{i,t}]_j||_2 > gamma
@@ -159,7 +135,10 @@ class ROCRLLearner:
                     if np.linalg.norm(Rz_hat[j, :], ord = 2) > self.gamma:
                         adj[i, j] = 1
             
-            adj_tc = transitive_closure(adj)
+            if use_transitive_closure:
+                adj_tc = transitive_closure(adj)
+            else:
+                adj_tc = adj
             self.Ghat = adj_tc
             self.pat = parents_from_adj(adj_tc)
             return adj_tc
@@ -225,12 +204,13 @@ class ROCRLLearner:
                 X_pa = Z[pa, :].T # t x |pa|
                 y_i = Z[i, :].reshape(-1, 1) # t x 1
 
-                
+                gates_obs = np.array([1.0 if (i not in self.a_hist[s]) else 0.0 for s in range(t)])
+                w_obs = doubly_weighted_diag_weights(X_pa, gates_obs, zeta_t, ridge = self.ridge_reg)
+                W_obs = np.diag(w_obs)
 
 
                 parent_norms = np.linalg.norm(X_pa, axis = 1) + 1e-8
-                w_obs = self._build_weight_diag("obs", i, zeta_t, Vtilde_inv_norms = parent_norms)
-                W_obs = np.diag(w_obs)
+                
 
                 XtWX = X_pa.T @ W_obs @ X_pa + self.ridge_reg * np.eye(len(pa))
                 XtWY = X_pa.T @ W_obs @ y_i
@@ -238,7 +218,8 @@ class ROCRLLearner:
                 A[i, pa] = coef
 
                 if not hard:
-                    w_int = self._build_weight_diag("int", i, zeta_t, Vtilde_inv_norms = parent_norms)
+                    gates_int = np.array([1.0 if (i in self.a_hist[s]) else 0.0 for s in range(t)], dtype = float)
+                    w_int = doubly_weighted_diag_weights(X_pa, gates_int, zeta_t, ridge = self.ridge_reg)
                     W_int = np.diag(w_int)
                     XtWXs = X_pa.T @ W_int @ X_pa + self.ridge_reg * np.eye(len(pa))
                     XtWYs = X_pa.T @ W_int @ y_i
@@ -249,12 +230,70 @@ class ROCRLLearner:
             
             U = np.asarray(self.U_hist).reshape(-1,1)
             X_theta = Z.T
-            z_norms = np.linalg.norm(X_theta, axis = 1) + 1e-8
-            w_theta = self._build_weight_diag("theta", None, zeta_t, Vtilde_inv_norms = z_norms)
+            gates_theta = np.ones(t, dtype = float)
+            w_theta = doubly_weighted_diag_weights(X_theta, gates_theta, zeta_t, ridge = self.ridge_reg)
             Wt = np.diag(w_theta)
 
             XtWX = X_theta.T @ Wt @ X_theta + self.ridge_reg * np.eye(t)
             XtWY = X_theta.T @ Wt @ U
             theta = np.linalg.solve(XtWX, XtWY).reshape(-1)
+
             return self.A, self.Astar, self.theta, Astar, theta
+
+        def choose_action_with_under_sampling(self, rng: np.random.Generator, intervention_type: str) -> int:
+            if self.Ghat is None:
+                pick = int(rng.choice(list(range(self.n + 1))))
+                return set() if pick == 0 else {pick}
+            
+            AUE, thresh = under_explored_set(
+                t = len(self.X_hist),
+                counts_A0 = self.counts_A0,
+                Ghat_adj = self.Ghat,
+                d = self.d,
+                n = self.n,
+                epsmax = self.epsmax,
+                delta = self.delta,
+                intervention_type = intervention_type
+            )
+            if len(AUE) == 0:
+                return None
+            pick = int(rng.choice(AUE))
+            return set() if pick == 0 else {pick}
+        
+
+
+        def learner_update(self, intervention_type: str, zeta_t: float = 1.0):
+            
+            if intervention_type == "soft":
+                self.update_H()
+                self.estimate_Zhat()
+                self.update_graph(use_transitive_closure = True)
+                
+            else: # intervention_type == "hard"
+                self.update_H()
+                self.estimate_Zhat()
+                self.update_graph(use_transitive_closure = True)
+                self.hard_refine_H()
+                self.estimate_Zhat()
+                self.update_graph(use_transitive_closure = False)
+            
+            t = max(1, len(self.X_hist))
+            AUE, thresh = under_explored_set(
+                t = t,
+                counts_A0 = self.counts_A0,
+                Ghat_adj = self.Ghat,
+                d = self.d,
+                n = self.n,
+                epsmax = self.epsmax,
+                delta = self.delta,
+                intervention_type = intervention_type
+            )
+
+            did_fit = False
+            if len(AUE) == 0:
+                self.fit_sem_and_theta(zeta_t = zeta_t, hard = intervention_type == "hard")
+                did_fit = True
+                # UCB selection
+            
+            return AUE, thresh, did_fit
         
