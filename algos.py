@@ -184,3 +184,77 @@ class ROCRLLearner:
             H_new = (np.eye(self.n) - Xi) @ self.H
             self.H = H_new
             return H_new
+        
+        def _build_weight_diag(
+            self,
+            which: str,
+            i: Optional[int],
+            zeta_t: float, 
+            Vtilde_inv_norms: Sequence[float]
+        ) -> np.ndarray:
+            """
+            Assemble weight diagonals given V^tilde inverse norms
+            """
+            t = len(self.X_hist)
+            w = np.zeros(t)
+
+            for s in range(t):
+                a_s = self.a_hist[s]
+                if which == "obs":
+                    assert i is not None
+                    gate = 1.0 if (i not in a_s) else 0.0
+                elif which == "int":
+                    assert i is not None
+                    gate = 1.0 if (i in a_s) else 0.0
+                elif which == "theta":
+                    gate = 1.0
+            
+                bonus_inv = 0.0 if Vtilde_inv_norms[s] <= 0 else 1.0 / Vtilde_inv_norms[s]
+                w[s] = gate * (1.0 / zeta_t) * min(1.0, bonus_inv)
+            return w
+        
+        def fit_sem_and_theta(self, zeta_t: float = 1.0, hard: bool = False):
+
+            Z = self.Zhat # n x t
+            t = Z.shape[1]
+            A = np.zeros((selfn.n, self.n))
+            for i in range(self.n):
+                pa = self.pat[i]
+                if len(pa) == 0:
+                    continue
+                X_pa = Z[pa, :].T # t x |pa|
+                y_i = Z[i, :].reshape(-1, 1) # t x 1
+
+                
+
+
+                parent_norms = np.linalg.norm(X_pa, axis = 1) + 1e-8
+                w_obs = self._build_weight_diag("obs", i, zeta_t, Vtilde_inv_norms = parent_norms)
+                W_obs = np.diag(w_obs)
+
+                XtWX = X_pa.T @ W_obs @ X_pa + self.ridge_reg * np.eye(len(pa))
+                XtWY = X_pa.T @ W_obs @ y_i
+                coef = np.linalg.solve(XtWX, XtWY).reshape(-1)
+                A[i, pa] = coef
+
+                if not hard:
+                    w_int = self._build_weight_diag("int", i, zeta_t, Vtilde_inv_norms = parent_norms)
+                    W_int = np.diag(w_int)
+                    XtWXs = X_pa.T @ W_int @ X_pa + self.ridge_reg * np.eye(len(pa))
+                    XtWYs = X_pa.T @ W_int @ y_i
+                    coef_s = np.linalg.solve(XtWXs, XtWYs).reshape(-1)
+                    Astar[i, pa] = coef_s
+            if hard:
+                Astar[:] = 0.0
+            
+            U = np.asarray(self.U_hist).reshape(-1,1)
+            X_theta = Z.T
+            z_norms = np.linalg.norm(X_theta, axis = 1) + 1e-8
+            w_theta = self._build_weight_diag("theta", None, zeta_t, Vtilde_inv_norms = z_norms)
+            Wt = np.diag(w_theta)
+
+            XtWX = X_theta.T @ Wt @ X_theta + self.ridge_reg * np.eye(t)
+            XtWY = X_theta.T @ Wt @ U
+            theta = np.linalg.solve(XtWX, XtWY).reshape(-1)
+            return self.A, self.Astar, self.theta, Astar, theta
+        
