@@ -1,6 +1,44 @@
 import numpy as np
 from typing import List, Set, Dict, Iterable, Optional, Tuple
 
+# Counter for how often we fall back due to non-acyclic graph (under_explored_set + ucb_mc)
+_acyclicity_fallback_count: int = 0
+
+
+def get_acyclicity_fallback_count() -> int:
+    """Return the number of times the estimated graph was non-acyclic and a fallback was used."""
+    return _acyclicity_fallback_count
+
+
+def reset_acyclicity_fallback_count() -> None:
+    """Reset the acyclicity fallback counter to 0 (e.g. at the start of a new run)."""
+    global _acyclicity_fallback_count
+    _acyclicity_fallback_count = 0
+
+
+def record_acyclicity_fallback() -> None:
+    """Increment the acyclicity fallback counter (e.g. when topo_order_from_adj fails elsewhere)."""
+    global _acyclicity_fallback_count
+    _acyclicity_fallback_count += 1
+
+def gamma_schedule_noise_margin(S_t, t, q_noise=0.25, q_signal=0.90, c=0.5):
+    """
+    gamma_t = noise_floor + margin
+    noise_floor ~ lower quantile of scores
+    margin ~ c * (signal_scale - noise_floor) / sqrt(t)
+    """
+    n = S_t.shape[0]
+    vals = S_t[~np.eye(n, dtype=bool)]
+    vals = vals[np.isfinite(vals)]
+    if len(vals) == 0:
+        return 0.0
+
+    noise = float(np.quantile(vals, q_noise))
+    signal = float(np.quantile(vals, q_signal))
+    scale = max(signal - noise, 1e-12)
+
+    margin = c * scale / np.sqrt(max(t, 1))
+    return noise + margin
 
 def sym(A: np.ndarray) -> np.ndarray:
     return 0.5 * (A + A.T)
@@ -12,6 +50,9 @@ def principal_eigvec(R: np.ndarray) -> np.ndarray:
     return V[:, idx]
 
 def cov_from_sum(sum_x: np.ndarray, sum_xxT: np.ndarray, n: int) -> np.ndarray:
+    if n <= 0:
+        d = sum_x.shape[0]
+        return np.zeros((d, d))
     mu = sum_x / n
     return (sum_xxT / n) - np.outer(mu, mu)
 
@@ -37,34 +78,6 @@ def parents_from_adj(adj: np.ndarray) -> List[List[int]]:
     n = adj.shape[0]
     return [list(np.where(adj[:, j] != 0)[0]) for j in range(n)]
 
-def doubly_weighted_diag_weights(
-    Zfeat: np.ndarray,
-    gates: np.ndarray,
-    zeta_t: float,
-    ridge: float = 1.0
-) -> np.ndarray:
-    
-    t, p = Zfeat.shape
-    w = np.zeros(t, dtype = float)
-    Vtilde = ridge * np.eye(p)
-    for s in range(t):
-        if gates[s] == 0.0:
-            w[s] = 0.0
-            continue
-        z = Zfeat[s, :].reshape(p, 1)
-        Vinv = np.linalg.pinv(Vtilde)
-        norm = float(np.sqrt(max((z.T @ Vinv @ z)[0,0], 1e-12)))
-        w[s] = (1.0 / zeta_t) * min(1.0, 1.0 / norm)
-
-        Vtilde = Vtilde + (w[s] ** 2) * (z @ z.T)
-    return w
-
-def delta_schedule(delta: float, t: int) -> float:
-    return float(6.0 * delta / (np.pi**2 * (t**2)))
-
-def N_eps(d: int, eps: float, delta_t: float, C: float = 1.0) -> int:
-    return int(np.ceil(C * (d + np.log(1.0 / max(delta_t, 1e-12))) / (eps**2)))
-
 def topo_order_from_adj(adj: np.ndarray) -> List[int]:
     n = adj.shape[0]
     indeg = adj.sum(axis = 0).astype(int).tolist()
@@ -81,17 +94,99 @@ def topo_order_from_adj(adj: np.ndarray) -> List[int]:
         raise ValueError("Graph is not acyclic")
     return out
 
+
+#-----------------------------------------------------------
+# Doubly-weighted ridge regression weight matrices
+#-----------------------------------------------------------
+
+def doubly_weighted_diag_weights(
+    Zfeat: np.ndarray,
+    gates: np.ndarray,
+    zeta_t: float,
+    ridge: float = 1.0
+) -> np.ndarray:
+
+    """
+    Implements the iterative, inverse-weighted leverage-score weights
+    Returns the diagonal weights w_s
+    Zfeat: (t,p) design matrix
+    gates: (t,) in {0,1} gates
+    """
+    t, p = Zfeat.shape
+    w = np.zeros(t, dtype = float)
+    Vtilde = ridge * np.eye(p)
+    zeta_t = float(max(zeta_t, 1e-12))
+
+    for s in range(t):
+        if gates[s] == 0.0:
+            w[s] = 0.0
+            continue
+        z = Zfeat[s, :].reshape(p, 1)
+        Vinv = np.linalg.pinv(Vtilde)
+        lev = float((z.T @ Vinv @ z)[0,0])
+        norm = float(np.sqrt(max(lev, 1e-12))) # ||hat{Z}_t[pa_t(i),s]||_{tilde{V}^{-1}}
+        w[s] = (1.0 / zeta_t) * min(1.0, 1.0 / norm)
+
+        Vtilde = Vtilde + (w[s] ** 2) * (z @ z.T)
+    return w
+
+def doubly_weighted_gram(
+    Zfeat: np.ndarray,
+    gates: np.ndarray,
+    zeta_t: float,
+    ridge: float = 1.0
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Same iteration as doubly_weighted_diag_weights, but also returns the final Vtilde (Gram).
+    """
+    t, p = Zfeat.shape
+    w = np.zeros(t, dtype=float)
+    Vtilde = ridge * np.eye(p)
+
+    zeta_t = float(max(zeta_t, 1e-12))
+
+    for s in range(t):
+        if gates[s] == 0.0:
+            w[s] = 0.0
+            continue
+        z = Zfeat[s, :].reshape(p, 1)
+        Vinv = np.linalg.pinv(Vtilde)
+        lev = float((z.T @ Vinv @ z)[0, 0])
+        norm = float(np.sqrt(max(lev, 1e-12))) # ||hat{Z}_t[pa_t(i),s]||_{tilde{V}^{-1}}
+        w[s] = (1.0 / zeta_t) * min(1.0, 1.0 / norm)
+        Vtilde = Vtilde + (w[s] ** 2) * (z @ z.T)
+    return Vtilde, w
+
+
+def delta_schedule(delta: float, t: int) -> float:
+    return float(6.0 * delta / (np.pi**2 * (t**2)))
+
+def N_eps(d: int, eps: float, delta_t: float, C: float = 1.0) -> int:
+    return int(np.ceil(C * (d + np.log(1.0 / max(delta_t, 1e-12))) / (eps**2)))
+
+
+
 def parents_from_adj(adj: np.ndarray) -> List[List[int]]:
     n = adj.shape[0]
     return [list(np.where(adj[:, j] != 0)[0]) for j in range(n)]
 
 def compute_u_t_from_graph(adj: np.ndarray, intervention_type: str) -> float:
-    
-    adj_for_u = transitive_closure(adj) if intervention_type == "soft" else adj
+    """
+    Compute u_t from graph structure. If the graph is not acyclic (e.g. estimated
+    graph has cycles), returns a conservative fallback sqrt(n) so thresholding
+    still works.
+    """
     n = adj.shape[0]
+    if adj is None or n == 0:
+        return float(np.sqrt(max(n, 1)))
     pa = parents_from_adj(adj)
-    order = topo_order_from_adj(adj)
-    u_i = np.zeros(n)
+    try:
+        order = topo_order_from_adj(adj)
+    except ValueError:
+        # Estimated graph can be cyclic; use conservative fallback (same as no graph)
+        record_acyclicity_fallback()
+        return float(np.sqrt(n))
+    u_i = np.zeros(n, dtype=float)
     for i in order:
         if len(pa[i]) == 0:
             u_i[i] = 0.0
@@ -107,22 +202,27 @@ def f_t(
     epsmax: float,
     delta_t: float
 ) -> int:
-
+    t = max(int(t), 1)
     term1 = (d ** (1.0/3.0)) * (n ** (-2.0/3.0)) * (u_t ** (2.0/3.0)) * (t ** (2.0/3.0))
     term2 = N_eps(d, epsmax, delta_t)
     return int(np.ceil(max(term1, term2)))
 
 def under_explored_set(
     t: int,
-    counts_A0: dict,
+    counts_A0: Dict[int, int],
     Ghat_adj: np.ndarray,
+    d: int,
     n: int,
     epsmax: float,
     delta: float,
     intervention_type: str
-) -> typle[list[int], int]:
+) -> Tuple[List[int], int]:
+    """
+    Returns (AUE, threshold) where AUE is a list of action-ids in {0,1,...,n}
+    whose counts are below the current threshold.
+    """
     delta_t = delta_schedule(delta, t)
-    uval = compute_u_t_from_graph(Ghat_adj, intervention_type)
+    uval = compute_u_t_from_graph(Ghat_adj, intervention_type) if Ghat_adj is not None else float(np.sqrt(n))
     thresh = f_t(t, d, n, uval, epsmax, delta_t)
     AUE = [a_id for a_id in range(n + 1) if counts_A0.get(a_id, 0) < thresh]
     return AUE, thresh
