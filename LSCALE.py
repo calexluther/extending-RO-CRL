@@ -124,7 +124,7 @@ def _get_graph(
     # compute edge weights for each node: || Rhat^Z_i[j,:] ||_2 for j = 1, ..., n
     dag_est_wo_th = np.stack([np.linalg.vector_norm(rzs[i], axis = 0) for i in range(n)]).T
     # threshold with gamma
-    dag_est - dag_est_wo_th > gamma
+    dag_est = dag_est_wo_th > gamma
     # remove self-loops
     np.fill_diagonal(dag_est, False)
 
