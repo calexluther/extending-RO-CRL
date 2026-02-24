@@ -165,7 +165,6 @@ def N_eps(d: int, eps: float, delta_t: float, C: float = 1.0) -> int:
     return int(np.ceil(C * (d + np.log(1.0 / max(delta_t, 1e-12))) / (eps**2)))
 
 
-
 def parents_from_adj(adj: np.ndarray) -> List[List[int]]:
     n = adj.shape[0]
     return [list(np.where(adj[:, j] != 0)[0]) for j in range(n)]

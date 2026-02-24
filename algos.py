@@ -2,7 +2,7 @@ import numpy as np
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 from utilities import *
-from ucb import ucb_mc
+from ucb import ucb_mc, precompute_ucb_sqrt
 
 @dataclass
 class ActionCovStats:
@@ -216,7 +216,8 @@ class ROCRLLearner:
                     adj[i, j] = 1
         
         if len(self.X_hist) % self.gamma_update_every == 0:
-            self.gamma = self.gamma_schedule_noise_margin(S_t, len(self.X_hist))
+            adj = np.zeros((self.n_latent, self.n_latent), dtype=int)
+            self.gamma = gamma_schedule_noise_margin(S_t, len(self.X_hist))
             for i in range(self.n_latent):
                 for j in range(self.n_latent):
                     if S_t[i, j] > self.gamma:
@@ -371,6 +372,13 @@ class ROCRLLearner:
             hard=hard
         )
 
+        M_theta = self.M_theta if self.M_theta is not None else np.eye(self.n_latent)
+        precomputed_sqrt = precompute_ucb_sqrt(
+            M_theta=M_theta,
+            M_row_obs=self.M_row_obs,
+            M_row_int=self.M_row_int,
+        )
+
         best_val = -1e18
         best_a = None
 
@@ -391,7 +399,8 @@ class ROCRLLearner:
                 adj=self.G_adj if self.G_adj is not None else np.zeros((self.n_latent, self.n_latent), dtype=int),
                 hard=hard,
                 num_mc=num_mc,
-                rng=rng
+                rng=rng,
+                precomputed_sqrt=precomputed_sqrt,
             )
             if val > best_val:
                 best_val = val

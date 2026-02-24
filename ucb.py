@@ -29,19 +29,50 @@ def expected_z_from_A_nu(A: np.ndarray, nu: np.ndarray, L: int) -> np.ndarray:
     return out
 
 
-def sample_from_ellipsoid(xhat: np.ndarray, M: np.ndarray, beta: float, rng: np.random.Generator) -> np.ndarray:
-    p = xhat.shape[0]
+def compute_ellipsoid_sqrt(M: np.ndarray) -> np.ndarray:
+    """Precompute Minv_sqrt for ellipsoid sampling. O(p^3) once instead of per sample."""
+    M = np.asarray(M)
     Minv = np.linalg.pinv(M)
     w, V = np.linalg.eigh((Minv + Minv.T) / 2.0)
     w = np.maximum(w, 0.0)
-    Minv_sqrt = V @ np.diag(np.sqrt(w)) @ V.T
+    return V @ np.diag(np.sqrt(w)) @ V.T
 
-    g = rng.normal(size = p)
+
+def sample_from_ellipsoid_fast(
+    xhat: np.ndarray,
+    Minv_sqrt: np.ndarray,
+    beta: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Sample from ellipsoid using precomputed Minv_sqrt. No pinv/eigh in the loop."""
+    p = xhat.shape[0]
+    g = rng.normal(size=p)
     ng = np.linalg.norm(g) + 1e-12
     direction = g / ng
-    d = Minv_sqrt @ direction
-    d = d * np.sqrt(beta)
+    d = Minv_sqrt @ direction * np.sqrt(beta)
     return xhat + d
+
+
+def sample_from_ellipsoid(xhat: np.ndarray, M: np.ndarray, beta: float, rng: np.random.Generator) -> np.ndarray:
+    p = xhat.shape[0]
+    Minv_sqrt = compute_ellipsoid_sqrt(M)
+    return sample_from_ellipsoid_fast(xhat, Minv_sqrt, beta, rng)
+
+def precompute_ucb_sqrt(
+    M_theta: np.ndarray,
+    M_row_obs: Dict[int, np.ndarray],
+    M_row_int: Dict[int, np.ndarray],
+) -> Dict:
+    """
+    Precompute ellipsoid sqrt factors once per UCB step. Returns dict with
+    'M_theta_sqrt', 'M_row_obs_sqrt', 'M_row_int_sqrt' for use in ucb_mc fast path.
+    """
+    return {
+        "M_theta_sqrt": compute_ellipsoid_sqrt(np.asarray(M_theta)),
+        "M_row_obs_sqrt": {i: compute_ellipsoid_sqrt(np.asarray(M)) for i, M in M_row_obs.items()},
+        "M_row_int_sqrt": {i: compute_ellipsoid_sqrt(np.asarray(M)) for i, M in M_row_int.items()},
+    }
+
 
 def build_A_tilde(
     Ahat: np.ndarray,
@@ -52,7 +83,8 @@ def build_A_tilde(
     M_row_int: Dict[int, np.ndarray],
     beta_row: Dict[int, float],
     rng: np.random.Generator,
-    hard: bool
+    hard: bool,
+    precomputed_sqrt: Optional[Dict] = None,
 ) -> np.ndarray:
     n = Ahat.shape[0]
     Atilde = np.zeros((n, n))
@@ -63,14 +95,23 @@ def build_A_tilde(
         in_action = (i in action)
         if hard and in_action:
             continue
-        if in_action:
-            xhat = Astar_hat[i, pa]
-            M = M_row_int[i]
-        else:
-            xhat = Ahat[i, pa]
-            M = M_row_obs[i]
         beta = float(beta_row.get(i, 0.0))
-        xt = sample_from_ellipsoid(np.asarray(xhat), np.asarray(M), beta, rng)
+        if precomputed_sqrt is not None:
+            if in_action:
+                xhat = np.asarray(Astar_hat[i, pa])
+                Minv_sqrt = precomputed_sqrt["M_row_int_sqrt"][i]
+            else:
+                xhat = np.asarray(Ahat[i, pa])
+                Minv_sqrt = precomputed_sqrt["M_row_obs_sqrt"][i]
+            xt = sample_from_ellipsoid_fast(xhat, Minv_sqrt, beta, rng)
+        else:
+            if in_action:
+                xhat = np.asarray(Astar_hat[i, pa])
+                M = M_row_int[i]
+            else:
+                xhat = np.asarray(Ahat[i, pa])
+                M = M_row_obs[i]
+            xt = sample_from_ellipsoid(xhat, np.asarray(M), beta, rng)
         Atilde[i, pa] = xt
     return Atilde
 
@@ -130,24 +171,31 @@ def ucb_mc(
     beta_theta: float,
     rng: np.random.Generator,
     hard: bool,
-    num_mc: int = 64
+    num_mc: int = 64,
+    precomputed_sqrt: Optional[Dict] = None,
 ) -> float:
 
     L = longest_path_length(adj)
     best = -1e18
 
     for _ in range(int(max(1, num_mc))):
-        theta_tilde = sample_from_ellipsoid(theta_hat, M_theta, beta_theta, rng)
+        if precomputed_sqrt is not None:
+            theta_tilde = sample_from_ellipsoid_fast(
+                theta_hat, precomputed_sqrt["M_theta_sqrt"], beta_theta, rng
+            )
+        else:
+            theta_tilde = sample_from_ellipsoid(theta_hat, M_theta, beta_theta, rng)
         Atilde = build_A_tilde(
-            Ahat = Ahat,
-            Astar_hat = Astar_hat,
-            pat = pat,
-            action = action,
-            M_row_obs = M_row_obs,
-            M_row_int = M_row_int,
-            beta_row = beta_row,
-            rng = rng,
-            hard = hard
+            Ahat=Ahat,
+            Astar_hat=Astar_hat,
+            pat=pat,
+            action=action,
+            M_row_obs=M_row_obs,
+            M_row_int=M_row_int,
+            beta_row=beta_row,
+            rng=rng,
+            hard=hard,
+            precomputed_sqrt=precomputed_sqrt,
         )
         nu_a = nu_hat.copy()
         for i in action:
@@ -156,7 +204,7 @@ def ucb_mc(
         val = float(theta_tilde @ zmean)
         if val > best:
             best = val
-    
+
     return float(best)
 
 

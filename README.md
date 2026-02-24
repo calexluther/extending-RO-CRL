@@ -12,3 +12,7 @@
 2. Compare against SOTA bandit/CRL algorithms
 3. Test over multiple task families
 
+## Notes
+
+- Estimating $\hat{\nu}$
+  - currently ?
