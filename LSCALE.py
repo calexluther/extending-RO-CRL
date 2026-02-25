@@ -16,7 +16,6 @@ def LSCALE_i(
     hard_intervention: bool,                 # whether to perform hard intervention
     gamma: float,                            # graph threshold
     dim_reduction: bool = True,              # optional projection from d to n dimensions
-    hard_graph_postprocess: bool = False,    # whether to perform hard graph refinement
 ) -> Tuple[Tuple[FloatArray, BoolArray], Optional[Tuple[FloatArray, BoolArray]]]:
     """
     Returns baseline recovered H_t, H_t^hard and refined H_t, H_t^hard if hard_intervention is True.
