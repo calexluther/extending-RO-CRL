@@ -19,7 +19,8 @@ def LSCALE_i(
     hard_graph_postprocess: bool = False,    # whether to perform hard graph refinement
 ) -> Tuple[Tuple[FloatArray, BoolArray], Optional[Tuple[FloatArray, BoolArray]]]:
     """
-    Returns baseline recovered Zhat, Ghat and refined Zhat, Ghat if hard_intervention is True.
+    Returns baseline recovered H_t, H_t^hard and refined H_t, H_t^hard if hard_intervention is True.
+    Also returns the estimated graph Ghat_t.
     """
     assert x_samples.ndim == 2
     n_samples, d = x_samples.shape
@@ -29,7 +30,7 @@ def LSCALE_i(
 
     if dim_reduction: # reduce dimensionality from d to n
         x_svd = np.linalg.svd(x_samples[:n+d], full_matrices=False)
-        dec_colbt = x.svd.Vh[:n]
+        dec_colbt = x_svd.Vh[:n]
         x_samples = x_samples @ dec_colbt.T
     
     # organize samples by actions: x_by_mca0[a] is the stack of x_samples for action a
