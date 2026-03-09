@@ -86,7 +86,7 @@ def _unmixing_procedure(
     """
     n = z_covs.shape[0]
     unmix_mat = np.eye(n)
-    for k in range(n): # will this throw an error if k = 0?
+    for k in range(n):
         ck = unmix_mat @ z_covs[top_order[k]]
         
         a_mat = ck[np.ix_(top_order[:k], top_order[:k])] # submatrix of latent covariances for ancestors (?) of node k
