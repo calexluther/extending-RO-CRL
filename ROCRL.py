@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import FrozenSet, List, Optional, Tuple, Dict
 from LSCALE import LSCALE_i
 from ucb import ucb_bonus
+from metrics import expected_utility_under_action
 import numpy as np
 
 Action = FrozenSet[int]
@@ -93,6 +94,20 @@ class ROCRLLearner:
         self.decision_history: List[DecisionRecord] = []
         self.last_decision_mode: Optional[str] = None
         self.last_under_sampled_actions: List[Action] = []
+
+        self.instant_regret: List[float] = []
+        self.cum_regret: List[float] = []
+        self.expected_reward_history: List[float] = []
+        self.benchmark_reward: Optional[float] = None
+        self.benchmark_action: Optional[Action] = None
+
+        self.U_all: List[float] = []
+
+        self.theta_hat: Optional[np.ndarray] = None
+        self.theta_hat_history: List[np.ndarray] = []
+        self.V_theta: Optional[np.ndarray] = None
+        self.tilde_V_theta: Optional[np.ndarray] = None
+        self.VV_theta: Optional[np.ndarray] = None
 
         # Repo-style UCB counts
         # N_mca0 conceptually counts samples for each action in mca0.
@@ -219,6 +234,51 @@ class ROCRLLearner:
 
         return V, tilde_V, hat_b, VV
 
+    def estimate_theta(
+        self,
+        hat_Z: np.ndarray,      # shape (t, n)
+        U: np.ndarray,          # shape (t,)
+        zeta_t: float,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Estimate theta_t according to the paper's weighted ridge rule.
+
+        Returns
+        -------
+        theta_hat : (n,)
+        V_theta   : (n, n)
+        tilde_V_theta : (n, n)
+        VV_theta  : (n, n)
+        """
+        t, n = hat_Z.shape
+        if n != self.n:
+            raise ValueError(f"hat_Z should have {self.n} columns, got {n}")
+        if U.shape[0] != t:
+            raise ValueError(f"U should have length {t}, got {U.shape[0]}")
+
+        V_theta = np.eye(self.n, dtype=float)
+        tilde_V_theta = np.eye(self.n, dtype=float)
+        g_theta = np.zeros((self.n, 1), dtype=float)
+
+        for s in range(t):
+            z_s = hat_Z[s].reshape(-1, 1)   # (n, 1)
+
+            inv_tilde = np.linalg.inv(tilde_V_theta)
+            norm_term = float(np.sqrt(z_s.T @ inv_tilde @ z_s))
+            weight = (1.0 / zeta_t) * min(1.0, 1.0 / norm_term)
+
+            V_theta += weight * (z_s @ z_s.T)
+            tilde_V_theta += (weight ** 2) * (z_s @ z_s.T)
+            g_theta += weight * float(U[s]) * z_s
+
+        #print("V_theta shape:", V_theta.shape, "g_theta shape:", g_theta.shape)
+        #print("V_theta:", V_theta)
+        #print("g_theta:", g_theta)
+        theta_hat = np.linalg.solve(V_theta, g_theta).reshape(-1)
+        VV_theta = V_theta @ np.linalg.inv(tilde_V_theta) @ V_theta
+
+        return theta_hat, V_theta, tilde_V_theta, VV_theta
+
     def learn(self):
         """
         Main learning loop. 
@@ -289,6 +349,22 @@ class ROCRLLearner:
 
         V, tilde_V, hat_b, g__ = self.initialize_weight_matrices(pa)
         zeta_t = 0.1 * len(self.X_all) * np.sqrt((self.d + np.log(1.0 / delta_t)) / f_t_val)
+
+
+        U_all = np.asarray(self.U_all, dtype=float)
+
+        theta_hat, V_theta, tilde_V_theta, VV_theta = self.estimate_theta(
+            hat_Z=hat_Z,
+            U=U_all,
+            zeta_t=zeta_t,
+        )
+
+        self.theta_hat = theta_hat
+        self.V_theta = V_theta
+        self.tilde_V_theta = tilde_V_theta
+        self.VV_theta = VV_theta
+        self.theta_hat_history.append(theta_hat.copy())
+
         V, tilde_V, hat_b, VV = self.build_weight_matrices(
             hat_Z=hat_Z,
             V=V,
@@ -344,6 +420,7 @@ class ROCRLLearner:
         a: Action,
         z_sample: np.ndarray,
         mixing_matrix: np.ndarray,
+        utility_obs: Optional[float] = None,
     ) -> None:
 
         z_sample = np.asarray(z_sample, dtype=float).reshape(-1)
@@ -358,6 +435,11 @@ class ROCRLLearner:
 
         x_sample = z_sample @ mixing_matrix.T   # shape (d,)
         self.X_all.append(np.asarray(x_sample, dtype=float).reshape(-1))
+
+        if utility_obs is not None:
+            self.U_all.append(float(utility_obs))
+        else:
+            self.U_all.append(np.nan)
 
         # ------------------------------------------------------------
         # 2) Update under-sampling counts on MCA0 = {emptyset, singleton}
@@ -376,7 +458,13 @@ class ROCRLLearner:
             self.X_crl.append(np.asarray(x_sample, dtype=float).reshape(-1))
                 
 
-    def seed_initial_pools(self, scm, mixing_matrix: np.ndarray) -> None:
+    def seed_initial_pools(
+        self,
+        env,
+        mixing_matrix: np.ndarray,
+        kind: str = "none",
+        benchmark_action: Optional[set[int]] = None,
+    ) -> None:
         self.A_all.clear()
         self.Z_all.clear()
         self.X_all.clear()
@@ -386,9 +474,22 @@ class ROCRLLearner:
 
         self.N_mca0 = {a: 0 for a in self.mca0}
 
+        self.instant_regret.clear()
+        self.cum_regret.clear()
+        self.expected_reward_history.clear()
+
+        self.initialize_regret_benchmark(env, benchmark_action=benchmark_action, kind=kind)
+
+
         for a in self.forced_actions:
-            z_sample = np.asarray(scm.sample_latents(1, a), dtype=float).reshape(-1)
-            self.apply_action_and_update_pools(a, z_sample, mixing_matrix)
+            z_sample = np.asarray(env.sem.sample_latents(1, a), dtype=float).reshape(-1)
+            
+            utility_obs = float(z_sample @ env.utility.theta)
+            if env.utility.noise_std > 0:
+                utility_obs += float(np.random.uniform(0.0, env.utility.noise_std))
+            
+            self.apply_action_and_update_pools(a, z_sample, mixing_matrix, utility_obs)
+            self.record_regret(env, a, kind)
 
     def reconstruct_A_from_hat_b(
         self,
@@ -428,3 +529,42 @@ class ROCRLLearner:
                 Astar_hat[i, pa[i]] = b1[1:]
 
         return A_hat, Astar_hat, nu_hat, nu_star_hat
+
+    def initialize_regret_benchmark(
+        self,
+        env,
+        benchmark_action: Optional[set[int]] = None,
+        kind: str = "none",
+    ) -> None:
+        if benchmark_action is None:
+            benchmark_action = set()
+
+        self.benchmark_action = frozenset(benchmark_action)
+        self.benchmark_reward = expected_utility_under_action(
+            env,
+            action=set(self.benchmark_action),
+            kind=kind,
+        )
+
+
+    def record_regret(
+        self,
+        env,
+        action: Action,
+        kind: str = "none",
+    ) -> float:
+        if self.benchmark_reward is None:
+            raise ValueError("Benchmark reward not initialized. Call initialize_regret_benchmark first.")
+
+        reward_exp = expected_utility_under_action(env, action=set(action), kind=kind)
+        regret_t = float(self.benchmark_reward - reward_exp)
+
+        self.expected_reward_history.append(reward_exp)
+        self.instant_regret.append(regret_t)
+
+        if len(self.cum_regret) == 0:
+            self.cum_regret.append(regret_t)
+        else:
+            self.cum_regret.append(self.cum_regret[-1] + regret_t)
+
+        return regret_t

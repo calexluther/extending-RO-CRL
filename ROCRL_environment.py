@@ -160,6 +160,8 @@ class LinearUtility:
             th = self.rng.uniform( size = self.n)
         elif self.theta_dist == "normal":
             th = self.rng.normal(size = self.n)
+        elif self.theta_dist == "ones":
+            th = np.ones(self.n)
         else:
             raise ValueError(f"Invalid theta distribution: {self.theta_dist}")
         return self.theta_scale * th
