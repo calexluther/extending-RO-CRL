@@ -1,12 +1,10 @@
 import numpy as np
-from itertools import combinations
 
 def powerset_actions(n: int):
-    """All subsets of {0,...,n-1} as sets."""
-    items = list(range(n))
-    for r in range(n + 1):
-        for comb in combinations(items, r):
-            yield set(comb)
+    """Singleton interventions only: empty set + each single-node intervention."""
+    yield set()
+    for i in range(n):
+        yield {i}
 
 def expected_latent_mean_under_action(sem, action=set(), kind="none"):
     """
@@ -39,3 +37,34 @@ def expected_utility_under_action(env, action=set(), kind="none"):
 
 def fmt_action(a: set) -> str:
     return "∅" if len(a) == 0 else "{" + ",".join(map(str, sorted(a))) + "}"
+
+
+import math
+
+def delta_sched(t: int, delta: float) -> float:
+    return 6.0 * delta / (math.pi**2 * t**2)
+
+def N_eps(epsilon_max: float, delta_t: float, d: int, C_const: float = 1.0) -> float:
+    return (C_const**2) * (epsilon_max**-2) * (d + math.log(1.0 / delta_t))
+
+def choose_T0_from_paper(
+    n: int,
+    d: int,
+    epsilon_max: float,
+    delta: float = 0.1,
+    C_const: float = 1.0,
+    init_T0: int = 50,
+    max_iter: int = 100,
+) -> int:
+    """
+    Solve T0 ≈ N(epsilon_max, delta_{n T0}) by fixed-point iteration.
+    Returns an integer T0 rounded up.
+    """
+    T0 = max(1, init_T0)
+    for _ in range(max_iter):
+        dt = delta_sched(n * T0, delta)
+        T0_new = math.ceil(N_eps(epsilon_max, dt, d=d, C_const=C_const))
+        if T0_new == T0:
+            return T0
+        T0 = T0_new
+    return T0

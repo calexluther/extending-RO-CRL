@@ -28,8 +28,8 @@ def LSCALE_i(
     actions = list(map(frozenset, actions_as_list))
 
     if dim_reduction: # reduce dimensionality from d to n
-        x_svd = np.linalg.svd(x_samples[:n+d], full_matrices=False)
-        dec_colbt = x_svd.Vh[:n]
+        _, _, Vh_dr = np.linalg.svd(x_samples[:n+d], full_matrices=False)
+        dec_colbt = Vh_dr[:n]
         x_samples = x_samples @ dec_colbt.T
     
     # organize samples by actions: x_by_mca0[a] is the stack of x_samples for action a
@@ -49,9 +49,8 @@ def LSCALE_i(
     
     zhat_covs = enc_est_s @ x_covs @ enc_est_s.T # recomputed Sigma^Z_t = H_t Sigma_t H_t^T
 
-    # manual pinv computation (to get H_t^+)
-    enc_est_s_svd = np.linalg.svd(enc_est_s, full_matrices = False)
-    enc_est_s_pt = enc_est_s_svd.U @ np.diagflat(1 / enc_est_s_svd.S) @ enc_est_s_svd.Vh
+    # H_t^+ (pseudo-inverse of encoder)
+    enc_est_s_pt = np.linalg.pinv(enc_est_s)
     
     rzs = enc_est_s_pt @ rxs @ enc_est_s_pt.T # Rhat^Z_t = H_t^+ R_t H_t^+
 
@@ -109,7 +108,8 @@ def _get_encoder(rxs: FloatArray) -> FloatArray:
     n, _, d = rxs.shape
     enc_est = np.zeros((n, d))
     for i in range(n):
-        enc_est[i] = np.linalg.svd(rxs[i], full_matrices = False).Vh[0]
+        _, _, Vh_i = np.linalg.svd(rxs[i], full_matrices=False)
+        enc_est[i] = Vh_i[0]
     return enc_est
 
 
@@ -122,7 +122,7 @@ def _get_graph(
     """
     n, _, _ = rzs.shape
     # compute edge weights for each node: || Rhat^Z_i[j,:] ||_2 for j = 1, ..., n
-    dag_est_wo_th = np.stack([np.linalg.vector_norm(rzs[i], axis = 0) for i in range(n)]).T
+    dag_est_wo_th = np.stack([np.linalg.norm(rzs[i], axis=0) for i in range(n)]).T
     # threshold with gamma
     dag_est = dag_est_wo_th > gamma
     # remove self-loops

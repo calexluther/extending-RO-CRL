@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from typing import FrozenSet, List, Optional, Tuple, Dict
 from LSCALE import LSCALE_i
-from ucb import ucb_bonus
+from ucb import *
 from metrics import expected_utility_under_action
 import numpy as np
 
@@ -33,11 +33,15 @@ class ROCRLLearner:
         d: int,
         intervention_type: str,          # "soft" or "hard"
         gamma: float,
+        delta: float = 0.05,
+        epsilon_max: float = 0.25,
+        C_const: float = 1.0,
         lam: float = 1e-3,
         seed: int = 0,
         dim_reduction: bool = True,
         hard_unmixing: bool = False,
         T0: int = 3000,
+        print_debug: bool = False,
     ):
         assert intervention_type in ("soft", "hard")
         self.n, self.d = n, d
@@ -47,9 +51,12 @@ class ROCRLLearner:
         self.dim_reduction = dim_reduction
         self.hard_unmixing = hard_unmixing
         self.T0 = T0
-
+        self.delta_t = 0.1
+        self.delta = delta
+        self.epsilon_max = epsilon_max
+        self.C_const = C_const  
         self.rng = np.random.default_rng(seed)
-
+        self.print_debug = print_debug
         self.Ghat: Optional[np.ndarray] = None
         self.H_t: Optional[np.ndarray] = None
         self.Zhat_all: List[np.ndarray] = []
@@ -108,6 +115,8 @@ class ROCRLLearner:
         self.V_theta: Optional[np.ndarray] = None
         self.tilde_V_theta: Optional[np.ndarray] = None
         self.VV_theta: Optional[np.ndarray] = None
+        self.threshold_history: List[Tuple[int, float]] = []
+        self.f_t_val: Optional[float] = None
 
         # Repo-style UCB counts
         # N_mca0 conceptually counts samples for each action in mca0.
@@ -148,18 +157,45 @@ class ROCRLLearner:
 
         return float(np.sum(u_vec) + np.sqrt(self.n))
 
+    def get_delta_t(self, t: int, delta: float) -> float:
+        return 6.0 * delta / (np.pi**2 * (t**2))
     
-    def f_t(self, u: float) -> float:
-        t = max(len(self.X_all), 1)
-        return float((self.d ** (1 / 3)) * (self.n ** (2 / 3)) * (u ** (-2 / 3)) * (t ** (2 / 3)))
+    def N_eps(self, epsilon_max: float, delta_t: float, C_const: float = 1.0) -> float:
+        return (C_const**2) * (epsilon_max**-2) * (self.d + np.log(1.0 / delta_t))
 
-    def get_a0_UE(self, dag_est: np.ndarray, pa: List[List[int]]):
-        """
-        Get under-explored set of actions.
-        """
+    def f_t(self, u: float, t: int, delta_t: float, epsilon_max: float, C_const: float = 1.0) -> float:
+        leading = (self.d ** (1/3)) * (self.n ** (-2/3)) * (u ** (2/3)) * (t ** (2/3))
+        floor = self.N_eps(epsilon_max=epsilon_max, delta_t=delta_t, C_const=C_const)
+        if self.print_debug:
+            if (t + 1) % 500 == 0:
+                print(f"Leading: {leading}, Floor: {floor}, t: {t + 1}")
+        return float(min(max(leading, floor), 1000))
+
+    def current_mca0_counts(self) -> Dict[MCA0Action, int]:
+        counts = {a: 0 for a in self.mca0}
+        for a in self.A_all:
+            if a in counts:
+                counts[a] += 1
+        return counts
+
+
+    def get_a0_UE(
+        self,
+        dag_est: np.ndarray,
+        pa: List[List[int]],
+        delta: float,
+        epsilon_max: float,
+        C_const: float = 1.0,
+    ) -> List[MCA0Action]:
+        t = max(len(self.X_all), 1)
+        self.delta_t = self.get_delta_t(t, delta)
         u = self.compute_u_from_graph(dag_est, pa)
-        f_t_val = self.f_t(u)
-        return [a for a in self.mca0 if self.N_mca0[a] < f_t_val]
+        self.f_t_val = self.f_t(u=u, t=t, delta_t=self.delta_t, epsilon_max=epsilon_max, C_const=C_const)
+        self.threshold_history.append((t, self.f_t_val))
+        counts = self.current_mca0_counts()
+        self.N_mca0 = counts
+        return [a for a in self.mca0 if counts[a] < self.f_t_val]
+
     
     
     def initialize_weight_matrices(
@@ -322,11 +358,11 @@ class ROCRLLearner:
         )
         self.order = topo
 
-        a0_ue = self.get_a0_UE(dag_est, pa)
+        a0_ue = self.get_a0_UE(dag_est, pa, delta = self.delta, epsilon_max = self.epsilon_max, C_const = self.C_const)
         self.last_under_sampled_actions = list(a0_ue)
 
         if len(a0_ue) > 0:
-            a = a0_ue[0]
+            a = a0_ue[int(self.rng.integers(len(a0_ue)))]
             self.last_decision_mode = "under_sampled"
 
             self.decision_history.append(
@@ -336,19 +372,18 @@ class ROCRLLearner:
                     action=a,
                     mode="under_sampled",
                     under_sampled_actions=list(a0_ue),
-                    chosen_action_index=0,
+                    chosen_action_index = None,
                 )
             )
             return a
 
         u = self.compute_u_from_graph(dag_est, pa)
-        f_t_val = self.f_t(u)
+        f_t_val = self.f_t(u, t = len(self.X_all), delta_t = self.delta_t, epsilon_max = self.epsilon_max, C_const = self.C_const)
 
-        delta_t = 0.1
         hat_Z = X_all @ enc_est.T
 
         V, tilde_V, hat_b, g__ = self.initialize_weight_matrices(pa)
-        zeta_t = 0.1 * len(self.X_all) * np.sqrt((self.d + np.log(1.0 / delta_t)) / f_t_val)
+        zeta_t = 0.1 * len(self.X_all) * np.sqrt((self.d + np.log(1.0 / self.delta_t)) / f_t_val)
 
 
         U_all = np.asarray(self.U_all, dtype=float)
@@ -387,21 +422,24 @@ class ROCRLLearner:
         self.nu_star_hat_history.append(nu_star_hat.copy())
         self.round_history.append(len(self.X_all))
 
-        mean, int_, Ni = ucb_bonus(
-            self.order,
-            pa,
-            self.Ni,
-            hat_b,
-            zeta_t,
-            delta_t,
-            len(self.X_all),
-            VV,
+        a, ucb_debug, Ni = ucb_action_level(
+            n=self.n,
+            topo=self.order,
+            pa=pa,
+            A_hat=self.A_hat,
+            Astar_hat=self.Astar_hat,
+            nu_hat=self.nu_hat,
+            nu_star_hat=self.nu_star_hat,
+            theta_hat=self.theta_hat,
+            VV=VV,
+            VV_theta=self.VV_theta,
+            Ni=self.Ni,
+            zeta_t=zeta_t,
+            delta_t=self.delta_t,
         )
         self.Ni = Ni
-
-        a = frozenset(int_)
+        self._cache["last_ucb_debug"] = ucb_debug
         self.last_decision_mode = "ucb"
-
         self.decision_history.append(
             DecisionRecord(
                 round_idx=len(self.decision_history),
@@ -448,14 +486,12 @@ class ROCRLLearner:
             self.N_mca0[a] += 1
 
         # ------------------------------------------------------------
-        # 3) Update the CRL pool only for observational/singleton actions
-        #    Matches: if len(a) == 1: int_lists += [a], z_samples append, x_samples append
+        # 3) Update the CRL pool (all actions are singletons)
         # ------------------------------------------------------------
-        if len(a) <= 1:
-            a_mca0 = frozenset(a)
-            self.A_crl.append(a_mca0)
-            self.Z_crl.append(z_sample.copy())
-            self.X_crl.append(np.asarray(x_sample, dtype=float).reshape(-1))
+        a_mca0 = frozenset(a)
+        self.A_crl.append(a_mca0)
+        self.Z_crl.append(z_sample.copy())
+        self.X_crl.append(np.asarray(x_sample, dtype=float).reshape(-1))
                 
 
     def seed_initial_pools(
@@ -482,7 +518,8 @@ class ROCRLLearner:
 
 
         for a in self.forced_actions:
-            z_sample = np.asarray(env.sem.sample_latents(1, a), dtype=float).reshape(-1)
+            kind = "none" if len(a) == 0 else self.intervention_type
+            z_sample = np.asarray(env.sem.sample_latents(1, a, kind=kind), dtype=float).reshape(-1)
             
             utility_obs = float(z_sample @ env.utility.theta)
             if env.utility.noise_std > 0:
